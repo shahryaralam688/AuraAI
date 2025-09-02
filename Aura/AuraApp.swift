@@ -10,10 +10,15 @@ import SwiftData
 
 @main
 struct AuraApp: App {
+    @StateObject private var locationManager = LocationManager()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(locationManager)
+                .onAppear {
+                    locationManager.requestLocationPermission()
+                }
         }
 
     }

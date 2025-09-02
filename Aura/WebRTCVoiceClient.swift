@@ -9,6 +9,7 @@ import Foundation
 import Combine
 import AVFAudio
 import WebRTC
+import AVFoundation
 
 // MARK: - Connection State
 enum VoiceConnectionState: String {
@@ -46,10 +47,19 @@ final class WebRTCVoiceClient: NSObject, ObservableObject {
     // Queues
     private let workQueue = DispatchQueue(label: "webrtc.voice.client")
 
+    // Notifications
+    private var notificationObservers: [NSObjectProtocol] = []
+
     init(backendBaseURL: URL) {
         self.backendBaseURL = backendBaseURL
         super.init()
         setupFactory()
+        configureAudioSessionForLoudspeaker()
+        registerForAudioSessionNotifications()
+    }
+
+    deinit {
+        removeAudioSessionNotifications()
     }
 
     // MARK: Public API
@@ -103,6 +113,111 @@ final class WebRTCVoiceClient: NSObject, ObservableObject {
             log("Audio session configured")
         } catch {
             log("Audio session error: \(error.localizedDescription)")
+        }
+    }
+
+    private func configureAudioSessionForLoudspeaker() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playAndRecord, options: [.defaultToSpeaker, .allowBluetooth])
+            try session.setActive(true)
+        } catch {
+            print("Failed to set audio session category to loudspeaker: \(error)")
+        }
+    }
+
+    // MARK: Audio Session Observing & Route Handling
+    private func registerForAudioSessionNotifications() {
+        let center = NotificationCenter.default
+        let obs1 = center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
+            self?.handleAudioSessionInterruption(note)
+        }
+        let obs2 = center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] note in
+            self?.handleAudioRouteChange(note)
+        }
+        let obs3 = center.addObserver(forName: AVAudioSession.mediaServicesWereLostNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.log("Audio media services were lost — will attempt to restore")
+        }
+        let obs4 = center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.log("Audio media services were reset — reconfiguring session")
+            self?.reconfigureAudioSessionAfterReset()
+        }
+        notificationObservers.append(contentsOf: [obs1, obs2, obs3, obs4])
+    }
+
+    private func removeAudioSessionNotifications() {
+        let center = NotificationCenter.default
+        for obs in notificationObservers { center.removeObserver(obs) }
+        notificationObservers.removeAll()
+    }
+
+    private func handleAudioSessionInterruption(_ notification: Notification) {
+        guard let info = notification.userInfo,
+              let typeRaw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else { return }
+
+        switch type {
+        case .began:
+            log("🔇 Audio interruption began")
+        case .ended:
+            let optionsRaw = info[AVAudioSessionInterruptionOptionKey] as? UInt
+            let options = AVAudioSession.InterruptionOptions(rawValue: optionsRaw ?? 0)
+            log("🔊 Audio interruption ended, options=\(options)")
+            // Reactivate if needed
+            activateAudioSessionIfNeeded()
+        @unknown default:
+            break
+        }
+    }
+
+    private func handleAudioRouteChange(_ notification: Notification) {
+        guard let info = notification.userInfo,
+              let reasonRaw = info[AVAudioSessionRouteChangeReasonKey] as? UInt,
+              let reason = AVAudioSession.RouteChangeReason(rawValue: reasonRaw) else { return }
+        log("🔀 Route change: reason=\(reason.rawValue)")
+        updateAudioRouteForCurrentOutputs()
+    }
+
+    private func reconfigureAudioSessionAfterReset() {
+        // Re-apply category and activation, then update route.
+        configureAudioSessionForLoudspeaker()
+        updateAudioRouteForCurrentOutputs()
+    }
+
+    private func activateAudioSessionIfNeeded() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setActive(true)
+            updateAudioRouteForCurrentOutputs()
+        } catch {
+            log("Audio session reactivate error: \(error.localizedDescription)")
+        }
+    }
+
+    private func updateAudioRouteForCurrentOutputs() {
+        let session = AVAudioSession.sharedInstance()
+        let outputs = session.currentRoute.outputs
+        let hasHeadphonesOrBT = outputs.contains { out in
+            switch out.portType {
+            case .headphones, .headsetMic, .bluetoothA2DP, .bluetoothHFP, .bluetoothLE:
+                return true
+            default:
+                return false
+            }
+        }
+
+        do {
+            if hasHeadphonesOrBT {
+                // Respect external routes; no override.
+                try session.overrideOutputAudioPort(.none)
+                log("🔈 Using external audio route: \(outputs.map { $0.portType.rawValue }.joined(separator: ", "))")
+            } else {
+                // Ensure loudspeaker when on device only.
+                try session.overrideOutputAudioPort(.speaker)
+                log("📢 Forced output to loudspeaker")
+            }
+        } catch {
+            log("Audio route override error: \(error.localizedDescription)")
         }
     }
 

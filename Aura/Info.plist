@@ -4,5 +4,7 @@
 <dict>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>This app uses the microphone to stream your voice to the AI.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>This app uses location to provide location-aware AI assistance.</string>
 </dict>
 </plist>
