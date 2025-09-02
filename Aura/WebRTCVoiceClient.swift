@@ -26,11 +26,14 @@ final class WebRTCVoiceClient: NSObject, ObservableObject {
 
     // Configure this to your backend base URL (must be HTTPS in production)
     private let backendBaseURL: URL
+    // Optional webhook to forward conversation events
+    private let webhookURL: URL? = URL(string: "https://family-jelsoft-laden-cast.trycloudflare.com/api/aura/webhook")
 
     // RTC
     private var factory: RTCPeerConnectionFactory!
     private var peerConnection: RTCPeerConnection?
     private var localAudioTrack: RTCAudioTrack?
+    private var dataChannel: RTCDataChannel?
 
     // Reconnection
     private var reconnectAttempts = 0
@@ -54,6 +57,7 @@ final class WebRTCVoiceClient: NSObject, ObservableObject {
         guard state != .connecting && state != .connected else { return }
         state = .connecting
         log("Starting voice session…")
+        postWebhook(event: "session_start", payload: [:])
         requestMicPermission { [weak self] granted in
             guard let self else { return }
             if !granted {
@@ -80,6 +84,7 @@ final class WebRTCVoiceClient: NSObject, ObservableObject {
         tearDownPeer()
         state = .disconnected
         log("Stopped voice session")
+        postWebhook(event: "session_stop", payload: [:])
     }
 
     // MARK: Setup
@@ -142,6 +147,17 @@ final class WebRTCVoiceClient: NSObject, ObservableObject {
         // Add the microphone track to the peer connection
         _ = pc?.add(track, streamIds: ["stream0"]) 
 
+        // Create data channel for JSON/text events from OpenAI
+        let dcConfig = RTCDataChannelConfiguration()
+        dcConfig.isOrdered = true
+        if let dc = pc?.dataChannel(forLabel: "oai-events", configuration: dcConfig) {
+            dc.delegate = self
+            self.dataChannel = dc
+            log("DataChannel created: label=\(dc.label)")
+        } else {
+            log("DataChannel creation failed")
+        }
+
         // Offer
         let offerConstraints = RTCMediaConstraints(mandatoryConstraints: [
             "OfferToReceiveAudio": "true",
@@ -165,6 +181,9 @@ final class WebRTCVoiceClient: NSObject, ObservableObject {
     }
 
     private func tearDownPeer() {
+        dataChannel?.delegate = nil
+        dataChannel?.close()
+        dataChannel = nil
         peerConnection?.close()
         peerConnection = nil
         localAudioTrack = nil
@@ -230,22 +249,21 @@ final class WebRTCVoiceClient: NSObject, ObservableObject {
 
     private func sendOfferToBackend(offer: RTCSessionDescription) {
         guard let key = ephemeralKey else { fail("Missing ephemeral key"); return }
-        let url = backendBaseURL.appendingPathComponent("/api/ai/webrtc_offer")
+        // OpenAI Realtime WebRTC expects POST to /v1/realtime?model=...
+        // with headers: Authorization: Bearer <ephemeral-key>, OpenAI-Beta: realtime=v1, Content-Type: application/sdp
+        // and raw SDP in the body, returning SDP answer as text.
+        let model = "gpt-4o-realtime-preview-2024-12-17"
+        guard let url = URL(string: "https://api.openai.com/v1/realtime?model=\(model)") else { fail("Invalid OpenAI URL"); return }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let payload = OfferRequest(key: key, sdp: offer.sdp)
-        do { request.httpBody = try JSONEncoder().encode(payload) } catch { fail("Offer encode error: \(error.localizedDescription)"); return }
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        request.setValue("realtime=v1", forHTTPHeaderField: "OpenAI-Beta")
+        request.setValue("application/sdp", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/sdp", forHTTPHeaderField: "Accept")
+        request.httpBody = offer.sdp.data(using: .utf8)
 
         // Log outgoing request
-        if let body = request.httpBody, let bodyStr = String(data: body, encoding: .utf8) {
-            log("➡️ Request: POST \(url.absoluteString)\n📦 Body: \(bodyStr)")
-        } else {
-            log("➡️ Request: POST \(url.absoluteString)")
-        }
-        if let headers = request.allHTTPHeaderFields, !headers.isEmpty {
-            log("➡️ Headers: \(headers)")
-        }
+        log("➡️ Request: POST \(url.absoluteString) [application/sdp] body=\(offer.sdp.count) chars\n📝 SDP (first 200): \(String(offer.sdp.prefix(200)))…")
 
         URLSession.shared.dataTask(with: request) { [weak self] data, resp, err in
             guard let self else { return }
@@ -255,52 +273,33 @@ final class WebRTCVoiceClient: NSObject, ObservableObject {
             }
             if let err { self.fail("Offer POST error: \(err.localizedDescription)"); return }
             guard let data else { self.fail("Empty answer body"); return }
-            if let body = String(data: data, encoding: .utf8) { self.log("⬅️ Body: \(body)") }
-            do {
-                let answer = try JSONDecoder().decode(AnswerResponse.self, from: data)
-                let remote = RTCSessionDescription(type: .answer, sdp: answer.sdp)
-                self.peerConnection?.setRemoteDescription(remote) { [weak self] err in
-                    if let err { self?.fail("setRemoteDescription error: \(err.localizedDescription)"); return }
-                    DispatchQueue.main.async {
-                        self?.state = .connected
-                        self?.reconnectAttempts = 0
-                        self?.log("Connected")
-                    }
+            // Try to decode as text SDP first; if it's JSON, log the error JSON explicitly
+            if let contentType = (resp as? HTTPURLResponse)?.allHeaderFields["Content-Type"] as? String, contentType.contains("application/json"),
+               let json = String(data: data, encoding: .utf8) {
+                self.fail("OpenAI error JSON: \(json)")
+                return
+            }
+            guard let answerSDP = String(data: data, encoding: .utf8) else {
+                self.fail("Answer not UTF-8 text")
+                return
+            }
+            self.log("⬅️ Answer SDP size=\(answerSDP.count) chars\n📝 SDP (first 200): \(String(answerSDP.prefix(200)))…")
+            let remote = RTCSessionDescription(type: .answer, sdp: answerSDP)
+            self.peerConnection?.setRemoteDescription(remote) { [weak self] err in
+                if let err { self?.fail("setRemoteDescription error: \(err.localizedDescription)"); return }
+                DispatchQueue.main.async {
+                    self?.state = .connected
+                    self?.reconnectAttempts = 0
+                    self?.log("Connected")
+                    self?.postWebhook(event: "connected", payload: [:])
                 }
-            } catch {
-                self.fail("Decode answer error: \(error.localizedDescription)")
             }
         }.resume()
     }
 
     private func postLocalIceCandidate(_ candidate: RTCIceCandidate) {
-        guard let key = ephemeralKey else { return }
-        let url = backendBaseURL.appendingPathComponent("/api/ai/ice_candidate")
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body = IceCandidatePayload(key: key, candidate: candidate.sdp, sdpMid: candidate.sdpMid, sdpMLineIndex: candidate.sdpMLineIndex)
-        do { request.httpBody = try JSONEncoder().encode(body) } catch { log("ICE encode error: \(error.localizedDescription)"); return }
-
-        // Log outgoing request
-        if let body = request.httpBody, let bodyStr = String(data: body, encoding: .utf8) {
-            log("➡️ Request: POST \(url.absoluteString)\n📦 Body: \(bodyStr)")
-        } else {
-            log("➡️ Request: POST \(url.absoluteString)")
-        }
-        if let headers = request.allHTTPHeaderFields, !headers.isEmpty {
-            log("➡️ Headers: \(headers)")
-        }
-
-        URLSession.shared.dataTask(with: request) { [weak self] data, resp, err in
-            guard let self else { return }
-            if let http = resp as? HTTPURLResponse {
-                self.log("⬅️ Status: \(http.statusCode) from \(url.host ?? "?")")
-                self.log("⬅️ Response Headers: \(http.allHeaderFields)")
-            }
-            if let err { self.log("❌ ICE POST error: \(err.localizedDescription)") }
-            if let data, let body = String(data: data, encoding: .utf8) { self.log("⬅️ Body: \(body)") }
-        }.resume()
+        // No-op for OpenAI Realtime WebRTC — ICE trickling handled internally by the peer connection
+        log("ICE candidate generated (not posted): sdpMid=\(candidate.sdpMid ?? "nil"), index=\(candidate.sdpMLineIndex)")
     }
 
     // MARK: Logging
@@ -313,11 +312,37 @@ final class WebRTCVoiceClient: NSObject, ObservableObject {
         }
     }
 
+    // MARK: Webhook Forwarding
+    private func postWebhook(event: String, payload: [String: Any]) {
+        guard let webhookURL else { return }
+        var body: [String: Any] = [
+            "event": event,
+            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "payload": payload
+        ]
+        // Attach app-side context if helpful
+        body["state"] = state.rawValue
+
+        do {
+            let data = try JSONSerialization.data(withJSONObject: body, options: [])
+            var req = URLRequest(url: webhookURL)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = data
+            URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+                if let err { self?.log("Webhook error: \(err.localizedDescription)") }
+            }.resume()
+        } catch {
+            log("Webhook JSON encode error: \(error.localizedDescription)")
+        }
+    }
+
     private func fail(_ message: String) {
         DispatchQueue.main.async {
             self.state = .error
             self.logs.append("ERROR: \(message)")
         }
+        postWebhook(event: "error", payload: ["message": message])
         scheduleReconnect()
     }
 
@@ -355,9 +380,37 @@ extension WebRTCVoiceClient: RTCPeerConnectionDelegate {
         postLocalIceCandidate(candidate)
     }
     func peerConnection(_ peerConnection: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) {}
-    func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {}
+    func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {
+        log("DataChannel opened by remote: label=\(dataChannel.label)")
+        self.dataChannel = dataChannel
+        dataChannel.delegate = self
+    }
     func peerConnection(_ peerConnection: RTCPeerConnection, didAdd rtpReceiver: RTCRtpReceiver, streams: [RTCMediaStream]) {
         // Remote audio will be played automatically by WebRTC when audio track is received and AVAudioSession is active.
         log("Remote track added: \(rtpReceiver.track?.kind ?? "?")")
+    }
+}
+
+// MARK: - RTCDataChannelDelegate
+extension WebRTCVoiceClient: RTCDataChannelDelegate {
+    func dataChannelDidChangeState(_ dataChannel: RTCDataChannel) {
+        log("DataChannel state=\(dataChannel.readyState.rawValue) label=\(dataChannel.label)")
+        postWebhook(event: "datachannel_state", payload: ["state": dataChannel.readyState.rawValue, "label": dataChannel.label])
+    }
+
+    func dataChannel(_ dataChannel: RTCDataChannel, didReceiveMessageWith buffer: RTCDataBuffer) {
+        if buffer.isBinary {
+            if let text = String(data: buffer.data, encoding: .utf8) {
+                log("📩 DataChannel binary->text: \(text)")
+                postWebhook(event: "oai_event", payload: ["raw_text": text, "format": "binary->text"]) 
+            } else {
+                log("📩 DataChannel received binary message (\(buffer.data.count) bytes)")
+                postWebhook(event: "oai_event_binary", payload: ["bytes": buffer.data.count])
+            }
+        } else {
+            let text = String(decoding: buffer.data, as: UTF8.self)
+            log("📩 DataChannel text: \(text)")
+            postWebhook(event: "oai_event", payload: ["raw_text": text, "format": "text"]) 
+        }
     }
 }
