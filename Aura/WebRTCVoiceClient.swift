@@ -1,0 +1,363 @@
+//
+//  WebRTCVoiceClient.swift
+//  Aura
+//
+//  Created by Cascade on 02/09/2025.
+//
+
+import Foundation
+import Combine
+import AVFAudio
+import WebRTC
+
+// MARK: - Connection State
+enum VoiceConnectionState: String {
+    case disconnected = "Disconnected"
+    case connecting = "Connecting"
+    case connected = "Connected"
+    case error = "Error"
+}
+
+// MARK: - WebRTC Client
+final class WebRTCVoiceClient: NSObject, ObservableObject {
+    // Public
+    @Published private(set) var state: VoiceConnectionState = .disconnected
+    @Published private(set) var logs: [String] = []
+
+    // Configure this to your backend base URL (must be HTTPS in production)
+    private let backendBaseURL: URL
+
+    // RTC
+    private var factory: RTCPeerConnectionFactory!
+    private var peerConnection: RTCPeerConnection?
+    private var localAudioTrack: RTCAudioTrack?
+
+    // Reconnection
+    private var reconnectAttempts = 0
+    private var maxReconnectAttempts = 3
+    private var reconnectWorkItem: DispatchWorkItem?
+
+    // Token
+    private var ephemeralKey: String?
+
+    // Queues
+    private let workQueue = DispatchQueue(label: "webrtc.voice.client")
+
+    init(backendBaseURL: URL) {
+        self.backendBaseURL = backendBaseURL
+        super.init()
+        setupFactory()
+    }
+
+    // MARK: Public API
+    func start() {
+        guard state != .connecting && state != .connected else { return }
+        state = .connecting
+        log("Starting voice session…")
+        requestMicPermission { [weak self] granted in
+            guard let self else { return }
+            if !granted {
+                self.fail("Microphone permission denied")
+                return
+            }
+            self.configureAVAudioSession()
+            self.fetchEphemeralKey { [weak self] result in
+                switch result {
+                case .success(let key):
+                    self?.ephemeralKey = key
+                    self?.createPeerAndConnect()
+                case .failure(let error):
+                    self?.fail("Token error: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    func stop() {
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        ephemeralKey = nil
+        tearDownPeer()
+        state = .disconnected
+        log("Stopped voice session")
+    }
+
+    // MARK: Setup
+    private func setupFactory() {
+        RTCInitializeSSL()
+        let encoderFactory = RTCDefaultVideoEncoderFactory()
+        let decoderFactory = RTCDefaultVideoDecoderFactory()
+        factory = RTCPeerConnectionFactory(encoderFactory: encoderFactory, decoderFactory: decoderFactory)
+    }
+
+    private func configureAVAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .defaultToSpeaker])
+            try session.setActive(true)
+            log("Audio session configured")
+        } catch {
+            log("Audio session error: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: Mic
+    private func requestMicPermission(_ completion: @escaping (Bool) -> Void) {
+        let session = AVAudioSession.sharedInstance()
+        switch session.recordPermission {
+        case .granted:
+            completion(true)
+        case .denied:
+            completion(false)
+        case .undetermined:
+            session.requestRecordPermission { granted in
+                DispatchQueue.main.async { completion(granted) }
+            }
+        @unknown default:
+            completion(false)
+        }
+    }
+
+    private func createLocalAudioTrack() -> RTCAudioTrack {
+        let audioSource = factory.audioSource(with: RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
+        let track = factory.audioTrack(with: audioSource, trackId: "ARDAMSa0")
+        return track
+    }
+
+    // MARK: Peer
+    private func createPeerAndConnect() {
+        let config = RTCConfiguration()
+        config.sdpSemantics = .unifiedPlan
+        config.iceServers = [
+            RTCIceServer(urlStrings: ["stun:stun.l.google.com:19302"]) // Add TURN in production
+        ]
+        let constraints = RTCMediaConstraints(mandatoryConstraints: nil,
+                                              optionalConstraints: ["DtlsSrtpKeyAgreement": "true"]) 
+        let pc = factory.peerConnection(with: config, constraints: constraints, delegate: self)
+        self.peerConnection = pc
+
+        // Local audio
+        let track = createLocalAudioTrack()
+        self.localAudioTrack = track
+        // Add the microphone track to the peer connection
+        _ = pc?.add(track, streamIds: ["stream0"]) 
+
+        // Offer
+        let offerConstraints = RTCMediaConstraints(mandatoryConstraints: [
+            "OfferToReceiveAudio": "true",
+            "VoiceActivityDetection": "true"
+        ], optionalConstraints: nil)
+        pc?.offer(for: offerConstraints) { [weak self] sdp, error in
+            guard let self else { return }
+            if let error {
+                self.fail("Offer error: \(error.localizedDescription)")
+                return
+            }
+            guard let sdp else {
+                self.fail("Offer error: nil SDP")
+                return
+            }
+            pc?.setLocalDescription(sdp) { [weak self] err in
+                if let err { self?.fail("setLocalDescription error: \(err.localizedDescription)"); return }
+                self?.sendOfferToBackend(offer: sdp)
+            }
+        }
+    }
+
+    private func tearDownPeer() {
+        peerConnection?.close()
+        peerConnection = nil
+        localAudioTrack = nil
+    }
+
+    // MARK: Backend
+    private struct TokenResponse: Decodable { let key: String }
+    private struct SDPObject: Codable { let type: String; let sdp: String }
+    private struct OfferRequest: Codable { let key: String; let sdp: String }
+    private struct AnswerResponse: Decodable { let sdp: String }
+    private struct IceCandidatePayload: Codable {
+        let key: String
+        let candidate: String
+        let sdpMid: String?
+        let sdpMLineIndex: Int32
+    }
+
+    private func fetchEphemeralKey(completion: @escaping (Result<String, Error>) -> Void) {
+        let url = backendBaseURL.appendingPathComponent("/api/aura/token")
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        // Log outgoing request
+        log("➡️ Request: GET \(url.absoluteString)")
+        if let headers = request.allHTTPHeaderFields, !headers.isEmpty {
+            log("➡️ Headers: \(headers)")
+        }
+
+        URLSession.shared.dataTask(with: request) { data, resp, err in
+            // Log response status and headers
+            if let http = resp as? HTTPURLResponse {
+                self.log("⬅️ Status: \(http.statusCode) from \(url.host ?? "?")")
+                self.log("⬅️ Response Headers: \(http.allHeaderFields)")
+            }
+
+            if let err {
+                self.log("❌ Token request error: \(err.localizedDescription)")
+                DispatchQueue.main.async { completion(.failure(err)) }
+                return
+            }
+            guard let data else {
+                self.log("❌ Token response had empty body")
+                DispatchQueue.main.async { completion(.failure(NSError(domain: "token", code: -1))) }
+                return
+            }
+
+            // Log raw body
+            if let body = String(data: data, encoding: .utf8) {
+                self.log("⬅️ Body: \(body)")
+            }
+
+            do {
+                let t = try JSONDecoder().decode(TokenResponse.self, from: data)
+                self.log("✅ Parsed token key: \(t.key)")
+                DispatchQueue.main.async { completion(.success(t.key)) }
+            } catch {
+                self.log("❌ Token decode error: \(error.localizedDescription)")
+                DispatchQueue.main.async { completion(.failure(error)) }
+            }
+        }.resume()
+    }
+
+    private func sendOfferToBackend(offer: RTCSessionDescription) {
+        guard let key = ephemeralKey else { fail("Missing ephemeral key"); return }
+        let url = backendBaseURL.appendingPathComponent("/api/ai/webrtc_offer")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let payload = OfferRequest(key: key, sdp: offer.sdp)
+        do { request.httpBody = try JSONEncoder().encode(payload) } catch { fail("Offer encode error: \(error.localizedDescription)"); return }
+
+        // Log outgoing request
+        if let body = request.httpBody, let bodyStr = String(data: body, encoding: .utf8) {
+            log("➡️ Request: POST \(url.absoluteString)\n📦 Body: \(bodyStr)")
+        } else {
+            log("➡️ Request: POST \(url.absoluteString)")
+        }
+        if let headers = request.allHTTPHeaderFields, !headers.isEmpty {
+            log("➡️ Headers: \(headers)")
+        }
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, resp, err in
+            guard let self else { return }
+            if let http = resp as? HTTPURLResponse {
+                self.log("⬅️ Status: \(http.statusCode) from \(url.host ?? "?")")
+                self.log("⬅️ Response Headers: \(http.allHeaderFields)")
+            }
+            if let err { self.fail("Offer POST error: \(err.localizedDescription)"); return }
+            guard let data else { self.fail("Empty answer body"); return }
+            if let body = String(data: data, encoding: .utf8) { self.log("⬅️ Body: \(body)") }
+            do {
+                let answer = try JSONDecoder().decode(AnswerResponse.self, from: data)
+                let remote = RTCSessionDescription(type: .answer, sdp: answer.sdp)
+                self.peerConnection?.setRemoteDescription(remote) { [weak self] err in
+                    if let err { self?.fail("setRemoteDescription error: \(err.localizedDescription)"); return }
+                    DispatchQueue.main.async {
+                        self?.state = .connected
+                        self?.reconnectAttempts = 0
+                        self?.log("Connected")
+                    }
+                }
+            } catch {
+                self.fail("Decode answer error: \(error.localizedDescription)")
+            }
+        }.resume()
+    }
+
+    private func postLocalIceCandidate(_ candidate: RTCIceCandidate) {
+        guard let key = ephemeralKey else { return }
+        let url = backendBaseURL.appendingPathComponent("/api/ai/ice_candidate")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body = IceCandidatePayload(key: key, candidate: candidate.sdp, sdpMid: candidate.sdpMid, sdpMLineIndex: candidate.sdpMLineIndex)
+        do { request.httpBody = try JSONEncoder().encode(body) } catch { log("ICE encode error: \(error.localizedDescription)"); return }
+
+        // Log outgoing request
+        if let body = request.httpBody, let bodyStr = String(data: body, encoding: .utf8) {
+            log("➡️ Request: POST \(url.absoluteString)\n📦 Body: \(bodyStr)")
+        } else {
+            log("➡️ Request: POST \(url.absoluteString)")
+        }
+        if let headers = request.allHTTPHeaderFields, !headers.isEmpty {
+            log("➡️ Headers: \(headers)")
+        }
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, resp, err in
+            guard let self else { return }
+            if let http = resp as? HTTPURLResponse {
+                self.log("⬅️ Status: \(http.statusCode) from \(url.host ?? "?")")
+                self.log("⬅️ Response Headers: \(http.allHeaderFields)")
+            }
+            if let err { self.log("❌ ICE POST error: \(err.localizedDescription)") }
+            if let data, let body = String(data: data, encoding: .utf8) { self.log("⬅️ Body: \(body)") }
+        }.resume()
+    }
+
+    // MARK: Logging
+    private func log(_ message: String) {
+        DispatchQueue.main.async {
+            let line = "[\(Date())] \(message)"
+            self.logs.append(line)
+            // Also mirror to Xcode console
+            print(line)
+        }
+    }
+
+    private func fail(_ message: String) {
+        DispatchQueue.main.async {
+            self.state = .error
+            self.logs.append("ERROR: \(message)")
+        }
+        scheduleReconnect()
+    }
+
+    private func scheduleReconnect() {
+        guard reconnectAttempts < maxReconnectAttempts else { return }
+        reconnectAttempts += 1
+        let delay = pow(2.0, Double(reconnectAttempts)) // 2,4,8s
+        log("Reconnecting in \(Int(delay))s… (attempt \(reconnectAttempts))")
+        reconnectWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.tearDownPeer()
+            self?.createPeerAndConnect()
+        }
+        reconnectWorkItem = work
+        workQueue.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+}
+
+// MARK: - RTCPeerConnectionDelegate
+extension WebRTCVoiceClient: RTCPeerConnectionDelegate {
+    func peerConnection(_ peerConnection: RTCPeerConnection, didChange stateChanged: RTCSignalingState) {
+        log("Signaling state: \(stateChanged.rawValue)")
+    }
+    func peerConnection(_ peerConnection: RTCPeerConnection, didAdd stream: RTCMediaStream) {}
+    func peerConnection(_ peerConnection: RTCPeerConnection, didRemove stream: RTCMediaStream) {}
+    func peerConnectionShouldNegotiate(_ peerConnection: RTCPeerConnection) {}
+    func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
+        log("ICE state: \(newState.rawValue)")
+        if newState == .failed || newState == .disconnected { scheduleReconnect() }
+    }
+    func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceGatheringState) {
+        log("ICE gathering: \(newState.rawValue)")
+    }
+    func peerConnection(_ peerConnection: RTCPeerConnection, didGenerate candidate: RTCIceCandidate) {
+        postLocalIceCandidate(candidate)
+    }
+    func peerConnection(_ peerConnection: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) {}
+    func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {}
+    func peerConnection(_ peerConnection: RTCPeerConnection, didAdd rtpReceiver: RTCRtpReceiver, streams: [RTCMediaStream]) {
+        // Remote audio will be played automatically by WebRTC when audio track is received and AVAudioSession is active.
+        log("Remote track added: \(rtpReceiver.track?.kind ?? "?")")
+    }
+}
