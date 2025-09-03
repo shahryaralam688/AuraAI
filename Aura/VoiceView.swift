@@ -72,6 +72,12 @@ struct VoiceView: View {
         .onChange(of: client.state) { _, newState in
             handleStateChange(newState)
         }
+        .onChange(of: client.lastAITranscript) { _, transcript in
+            guard let t = transcript?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else { return }
+            withAnimation(.spring(response: 0.6, dampingFraction: 0.8)) {
+                conversationHistory.append("AI: \(t)")
+            }
+        }
         .onChange(of: isListening) { _, newValue in
             glowAnimation = newValue
             waveAnimation = newValue

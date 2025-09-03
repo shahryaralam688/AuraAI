@@ -24,6 +24,8 @@ final class WebRTCVoiceClient: NSObject, ObservableObject {
     // Public
     @Published private(set) var state: VoiceConnectionState = .disconnected
     @Published private(set) var logs: [String] = []
+    // Emits last AI transcript received via DataChannel (plain string). View can observe and append to chat UI.
+    @Published var lastAITranscript: String? = nil
 
     // Configure this to your backend base URL (must be HTTPS in production)
     private let backendBaseURL: URL
@@ -491,6 +493,34 @@ private extension WebRTCVoiceClient {
             log("❌ DataChannel JSON encode error: \(error.localizedDescription)")
         }
     }
+
+    // Attempts to parse JSON text and extract a transcript string.
+    func extractTranscript(fromUTF8Text text: String) -> String? {
+        guard let data = text.data(using: .utf8) else { return nil }
+        do {
+            let json = try JSONSerialization.jsonObject(with: data)
+            return findTranscript(in: json)
+        } catch {
+            return nil
+        }
+    }
+
+    func findTranscript(in any: Any) -> String? {
+        // Look for common fields used by realtime APIs
+        if let dict = any as? [String: Any] {
+            if let t = dict["transcript"] as? String, !t.isEmpty { return t }
+            if let t = dict["text"] as? String, !t.isEmpty { return t }
+            if let msg = dict["message"] as? [String: Any] {
+                if let t = msg["transcript"] as? String, !t.isEmpty { return t }
+                if let t = msg["text"] as? String, !t.isEmpty { return t }
+            }
+            // Nested arrays or objects
+            for (_, v) in dict { if let t = findTranscript(in: v) { return t } }
+        } else if let arr = any as? [Any] {
+            for v in arr { if let t = findTranscript(in: v) { return t } }
+        }
+        return nil
+    }
 }
 
 // MARK: - RTCPeerConnectionDelegate
@@ -547,6 +577,9 @@ extension WebRTCVoiceClient: RTCDataChannelDelegate {
             if let text = String(data: buffer.data, encoding: .utf8) {
                 log("📩 DataChannel binary->text: \(text)")
                 postWebhook(event: "oai_event", payload: ["raw_text": text, "format": "binary->text"]) 
+                if let t = self.extractTranscript(fromUTF8Text: text) {
+                    DispatchQueue.main.async { self.lastAITranscript = t }
+                }
             } else {
                 log("📩 DataChannel received binary message (\(buffer.data.count) bytes)")
                 postWebhook(event: "oai_event_binary", payload: ["bytes": buffer.data.count])
@@ -555,6 +588,9 @@ extension WebRTCVoiceClient: RTCDataChannelDelegate {
             let text = String(decoding: buffer.data, as: UTF8.self)
             log("📩 DataChannel text: \(text)")
             postWebhook(event: "oai_event", payload: ["raw_text": text, "format": "text"]) 
+            if let t = self.extractTranscript(fromUTF8Text: text) {
+                DispatchQueue.main.async { self.lastAITranscript = t }
+            }
         }
     }
 }
