@@ -28,7 +28,7 @@ final class WebRTCVoiceClient: NSObject, ObservableObject {
     // Configure this to your backend base URL (must be HTTPS in production)
     private let backendBaseURL: URL
     // Optional webhook to forward conversation events
-    private let webhookURL: URL? = URL(string: "https://family-jelsoft-laden-cast.trycloudflare.com/api/aura/webhook")
+    private let webhookURL: URL? = URL(string: "https://placing-meets-wage-organisations.trycloudflare.com/api/aura/webhook")
 
     // RTC
     private var factory: RTCPeerConnectionFactory!
@@ -367,7 +367,7 @@ final class WebRTCVoiceClient: NSObject, ObservableObject {
         // OpenAI Realtime WebRTC expects POST to /v1/realtime?model=...
         // with headers: Authorization: Bearer <ephemeral-key>, OpenAI-Beta: realtime=v1, Content-Type: application/sdp
         // and raw SDP in the body, returning SDP answer as text.
-        let model = "gpt-4o-realtime-preview-2024-12-17"
+        let model = "gpt-realtime"
         guard let url = URL(string: "https://api.openai.com/v1/realtime?model=\(model)") else { fail("Invalid OpenAI URL"); return }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -476,6 +476,23 @@ final class WebRTCVoiceClient: NSObject, ObservableObject {
     }
 }
 
+// MARK: - DataChannel helpers
+private extension WebRTCVoiceClient {
+    func sendJSONOnDataChannel(_ object: [String: Any]) {
+        guard let dc = self.dataChannel else {
+            log("⚠️ Tried to send on data channel but it's nil")
+            return
+        }
+        do {
+            let data = try JSONSerialization.data(withJSONObject: object, options: [])
+            let ok = dc.sendData(RTCDataBuffer(data: data, isBinary: false))
+            log("➡️ DataChannel send (json, \(data.count) bytes) ok=\(ok)")
+        } catch {
+            log("❌ DataChannel JSON encode error: \(error.localizedDescription)")
+        }
+    }
+}
+
 // MARK: - RTCPeerConnectionDelegate
 extension WebRTCVoiceClient: RTCPeerConnectionDelegate {
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange stateChanged: RTCSignalingState) {
@@ -511,6 +528,18 @@ extension WebRTCVoiceClient: RTCDataChannelDelegate {
     func dataChannelDidChangeState(_ dataChannel: RTCDataChannel) {
         log("DataChannel state=\(dataChannel.readyState.rawValue) label=\(dataChannel.label)")
         postWebhook(event: "datachannel_state", payload: ["state": dataChannel.readyState.rawValue, "label": dataChannel.label])
+        
+        // When the data channel is open, request RTP Opus output so audio plays via the remote WebRTC track
+        if dataChannel.readyState == .open {
+            let update: [String: Any] = [
+                "type": "session.update",
+                "session": [
+                    "voice": "verse",
+                    "output_audio_format": "opus"
+                ]
+            ]
+            sendJSONOnDataChannel(update)
+        }
     }
 
     func dataChannel(_ dataChannel: RTCDataChannel, didReceiveMessageWith buffer: RTCDataBuffer) {
